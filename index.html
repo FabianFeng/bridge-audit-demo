@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>桥梁设计文档审校</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;0,500;0,600;1,400&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #F4F1EA;
+    --bg-soft: #EDE8DC;
+    --ink: #2A2823;
+    --ink-soft: #6B6557;
+    --accent: #C76A3A;
+    --accent-soft: #E8B69A;
+    --line: #D9D2C2;
+    --card: #FBF9F3;
+    --high: #C0392B;
+    --medium: #B7791F;
+    --low: #6B6557;
+  }
+  body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--ink); height: 100vh; overflow: hidden; }
+  .serif { font-family: 'Fraunces', Georgia, serif; }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  .card { background: var(--card); border: 1px solid var(--line); }
+  .pill { background: var(--bg-soft); color: var(--ink-soft); border: 1px solid var(--line); }
+  .accent { color: var(--accent); }
+  .bg-accent { background: var(--accent); }
+  .severity-high { color: var(--high); border-color: #E8B5AF; background: #FBE9E5; }
+  .severity-medium { color: var(--medium); border-color: #E8D4A8; background: #FAF1DE; }
+  .severity-low { color: var(--low); border-color: var(--line); background: var(--bg-soft); }
+  .drop-zone { border: 1.5px dashed var(--line); transition: all .15s ease; }
+  .drop-zone.dragging { border-color: var(--accent); background: rgba(199,106,58,0.05); }
+  .fade-in { animation: fadeIn .25s ease both; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+  .progress-bar { transition: width .3s ease; }
+  ::selection { background: var(--accent-soft); }
+
+  /* 文档预览：iframe 容器 */
+  #doc-frame { width: 100%; height: 100%; border: 0; background: white; }
+
+  .finding-card { transition: all .15s ease; cursor: pointer; }
+  .finding-card:hover { border-color: var(--accent); transform: translateX(-2px); }
+  .finding-card.active { border-color: var(--accent); box-shadow: -2px 0 0 var(--accent); }
+
+  .scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scrollbar::-webkit-scrollbar-track { background: transparent; }
+  .scrollbar::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+  .scrollbar::-webkit-scrollbar-thumb:hover { background: var(--ink-soft); }
+
+  /* 样例文件卡片 */
+  .sample-card {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card);
+    cursor: pointer; transition: all .15s ease;
+    text-align: left;
+  }
+  .sample-card:hover {
+    border-color: var(--accent);
+    transform: translateX(-2px);
+    background: #FBF6EF;
+  }
+  .sample-card.disabled { opacity: 0.5; cursor: not-allowed; }
+  .sample-icon {
+    width: 32px; height: 32px; flex-shrink: 0;
+    border-radius: 6px; background: var(--bg-soft);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent); font-family: 'Fraunces', serif; font-size: 14px;
+  }
+  .sample-text { flex: 1; min-width: 0; }
+  .sample-title { font-size: 13px; color: var(--ink); margin-bottom: 2px; }
+  .sample-meta { font-size: 11px; color: var(--ink-soft); }
+  .sample-arrow { color: var(--ink-soft); font-size: 12px; }
+
+  /* 底部计时器 */
+  #timer-bar {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+    border-top: 1px solid var(--line);
+    background: rgba(244,241,234,0.92);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--ink-soft);
+    user-select: none;
+  }
+  #timer-bar.hidden-bar { display: none; }
+  #timer-collapsed {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 14px; cursor: pointer; transition: background .1s;
+  }
+  #timer-collapsed:hover { background: rgba(0,0,0,0.03); }
+  #timer-dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--accent); opacity: 0.7;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  #timer-dot.done { background: #22c55e; animation: none; opacity: 0.8; }
+  @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 0.9; } }
+  #timer-elapsed { color: var(--accent); font-weight: 500; min-width: 42px; }
+  #timer-latest { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  #timer-toggle-icon { opacity: 0.45; font-size: 9px; margin-left: 4px; }
+
+  #timer-expanded {
+    display: none;
+    max-height: 180px; overflow-y: auto;
+    border-top: 1px solid var(--line);
+    padding: 6px 14px 8px;
+  }
+  #timer-bar.expanded #timer-expanded { display: block; }
+  #timer-bar.expanded #timer-toggle-icon { transform: rotate(180deg); }
+  .tlog-row {
+    display: flex; gap: 10px; align-items: baseline;
+    padding: 2px 0; border-bottom: 1px solid transparent;
+    line-height: 1.5;
+  }
+  .tlog-row:last-child { border-bottom: none; }
+  .tlog-t { color: var(--accent); opacity: 0.75; min-width: 42px; }
+  .tlog-msg { color: var(--ink); opacity: 0.7; }
+  .tlog-finding { color: var(--high); opacity: 0.8; }
+</style>
+</head>
+<body>
+
+<header class="border-b shrink-0" style="border-color: var(--line);">
+  <div class="px-6 py-3.5 flex items-baseline justify-between">
+    <div class="flex items-baseline gap-4">
+      <h1 class="serif text-xl font-medium tracking-tight">桥梁设计文档审校</h1>
+      <span class="text-xs" style="color: var(--ink-soft);" id="file-name-inline"></span>
+    </div>
+    <div class="flex items-center gap-4 text-xs mono" style="color: var(--ink-soft);">
+      <span id="stage-label">就绪</span>
+      <span id="progress-text"></span>
+    </div>
+  </div>
+  <div class="h-0.5" style="background: var(--bg-soft);">
+    <div id="progress-bar" class="progress-bar h-0.5 bg-accent" style="width: 0%;"></div>
+  </div>
+</header>
+
+<!-- 上传页 -->
+<section id="upload-page" class="absolute inset-0 flex items-center justify-center" style="background: var(--bg); padding-top: 60px;">
+  <div class="w-full max-w-2xl px-6">
+    <div id="drop-zone" class="drop-zone rounded-lg p-12 text-center">
+      <!-- 正常状态 -->
+      <div id="upload-idle">
+        <div class="serif text-2xl mb-3">上传待审核的设计文件</div>
+        <p class="text-sm mb-6" style="color: var(--ink-soft);">支持 .doc / .docx / .txt / .md / .pdf — 拖到此处或点击选择</p>
+        <label class="inline-block cursor-pointer">
+          <input type="file" id="file-input" class="hidden" accept=".doc,.docx,.txt,.md,.pdf" />
+          <span class="bg-accent text-white px-6 py-3 rounded-md text-sm font-medium hover:opacity-90 transition">选择文件</span>
+        </label>
+        <div class="mt-5 text-xs" style="color: var(--ink-soft);">
+          PDF 自动 OCR 识别，约需 5-8 分钟
+        </div>
+      </div>
+      <!-- 上传/处理中状态 -->
+      <div id="upload-loading" class="hidden">
+        <div class="flex items-center justify-center mb-5">
+          <svg class="animate-spin" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--accent);">
+            <path stroke-linecap="round" d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>
+          </svg>
+        </div>
+        <div class="serif text-xl mb-2" id="upload-loading-title">解析中…</div>
+        <p class="text-sm" style="color: var(--ink-soft);" id="upload-loading-sub">请稍候</p>
+      </div>
+    </div>
+
+    <!-- 样例文件：跳过上传，立即体验 -->
+    <div id="samples-block" class="mt-5">
+      <div class="text-xs mb-2 flex items-center gap-2" style="color: var(--ink-soft);">
+        <span class="serif">或直接体验样例文件</span>
+        <span class="flex-1 border-t" style="border-color: var(--line);"></span>
+      </div>
+      <div id="samples-list" class="space-y-2"></div>
+    </div>
+  </div>
+</section>
+
+<!-- 工作页：双栏 -->
+<main id="work-page" class="hidden h-[calc(100vh-49px)] grid" style="grid-template-columns: 1fr 480px;">
+
+  <!-- 左：原文 -->
+  <section class="border-r flex flex-col min-h-0" style="border-color: var(--line);">
+    <div class="border-b px-4 py-2 flex items-center gap-3 text-xs shrink-0" style="border-color: var(--line); background: var(--bg);">
+      <span class="serif text-sm" style="color: var(--ink-soft);">原文</span>
+      <div class="ml-auto flex items-center gap-1">
+        <input id="jump-input" type="number" class="w-16 px-2 py-1 text-xs mono rounded border" placeholder="行号" style="border-color: var(--line); background: var(--card);" />
+        <button id="jump-btn" class="pill px-2 py-1 rounded text-xs">跳转</button>
+      </div>
+    </div>
+    <iframe id="doc-frame" class="flex-1"></iframe>
+  </section>
+
+  <!-- 右：findings -->
+  <section class="flex flex-col min-h-0" style="background: var(--bg);">
+    <div class="border-b px-4 py-2 shrink-0" style="border-color: var(--line);">
+      <div class="flex items-center gap-3 mb-2">
+        <span class="serif text-sm" style="color: var(--ink-soft);">问题清单</span>
+        <span class="mono text-xs" id="source-stats" style="color: var(--ink-soft);"></span>
+        <button id="reset-btn" class="ml-auto text-xs pill px-2 py-1 rounded hover:opacity-80">换文件</button>
+      </div>
+      <div class="grid grid-cols-4 gap-1.5 mb-2">
+        <div class="card rounded p-2 text-center">
+          <div class="text-[10px]" style="color: var(--ink-soft);">总数</div>
+          <div class="serif text-lg font-medium" id="stat-total">0</div>
+        </div>
+        <div class="card rounded p-2 text-center">
+          <div class="text-[10px]" style="color: var(--high);">严重</div>
+          <div class="serif text-lg font-medium" style="color: var(--high);" id="stat-high">0</div>
+        </div>
+        <div class="card rounded p-2 text-center">
+          <div class="text-[10px]" style="color: var(--medium);">中等</div>
+          <div class="serif text-lg font-medium" style="color: var(--medium);" id="stat-medium">0</div>
+        </div>
+        <div class="card rounded p-2 text-center">
+          <div class="text-[10px]" style="color: var(--low);">轻微</div>
+          <div class="serif text-lg font-medium" id="stat-low">0</div>
+        </div>
+      </div>
+      <div class="flex items-center gap-1.5 text-xs">
+        <button class="filter-btn pill px-2.5 py-1 rounded-full text-[11px]" data-filter="all">全部</button>
+        <button class="filter-btn pill px-2.5 py-1 rounded-full text-[11px]" data-filter="high">严重</button>
+        <button class="filter-btn pill px-2.5 py-1 rounded-full text-[11px]" data-filter="medium">中等</button>
+        <button class="filter-btn pill px-2.5 py-1 rounded-full text-[11px]" data-filter="low">轻微</button>
+      </div>
+    </div>
+    <div id="findings" class="flex-1 overflow-auto scrollbar p-3 space-y-2"></div>
+    <div id="empty-hint" class="hidden p-8 text-center text-xs" style="color: var(--ink-soft);">暂无问题</div>
+  </section>
+
+</main>
+
+<!-- 底部计时器（初始隐藏，审核开始后显示） -->
+<div id="timer-bar" class="hidden-bar">
+  <div id="timer-collapsed">
+    <span id="timer-dot"></span>
+    <span id="timer-elapsed">00:00</span>
+    <span id="timer-latest">准备中…</span>
+    <span id="timer-toggle-icon">▲</span>
+  </div>
+  <div id="timer-expanded" class="scrollbar">
+    <div id="timer-log"></div>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const dropZone = $('#drop-zone');
+const fileInput = $('#file-input');
+const findingsEl = $('#findings');
+const docFrame = $('#doc-frame');
+
+let allFindings = [];
+let docLines = [];   // 仍用于「输入行号跳转」时的范围校验
+let currentFilter = 'all';
+let sourceCount = { rule: 0, llm: 0, cross: 0 };
+let baselineSummary = '';
+let activeFinding = null;
+
+// ---------- 计时器 ----------
+const timerBar = $('#timer-bar');
+const timerElapsed = $('#timer-elapsed');
+const timerLatest = $('#timer-latest');
+const timerDot = $('#timer-dot');
+const timerLog = $('#timer-log');
+let timerStart = null;
+let timerTick = null;
+let timerExpanded = false;
+let findingCount = 0;
+
+$('#timer-collapsed').addEventListener('click', () => {
+  timerExpanded = !timerExpanded;
+  timerBar.classList.toggle('expanded', timerExpanded);
+  if (timerExpanded) {
+    // 滚到底
+    setTimeout(() => {
+      const wrap = timerBar.querySelector('#timer-expanded');
+      wrap.scrollTop = wrap.scrollHeight;
+    }, 30);
+  }
+});
+
+function timerFmt(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  return String(m).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
+
+function timerShow() {
+  timerBar.classList.remove('hidden-bar');
+}
+
+function timerSetMsg(msg, cls) {
+  timerLatest.textContent = msg;
+  const t = timerStart ? timerFmt(Date.now() - timerStart) : '00:00';
+  const row = document.createElement('div');
+  row.className = 'tlog-row';
+  row.innerHTML = `<span class="tlog-t">${t}</span><span class="${cls || 'tlog-msg'}">${escape(msg)}</span>`;
+  timerLog.appendChild(row);
+  if (timerExpanded) {
+    const wrap = timerBar.querySelector('#timer-expanded');
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+}
+
+function timerStart_() {
+  timerStart = Date.now();
+  findingCount = 0;
+  timerShow();
+  timerDot.classList.remove('done');
+  timerTick = setInterval(() => {
+    timerElapsed.textContent = timerFmt(Date.now() - timerStart);
+  }, 500);
+  timerSetMsg('开始审核');
+}
+
+function timerFinish() {
+  clearInterval(timerTick);
+  timerDot.classList.add('done');
+  timerElapsed.textContent = timerFmt(Date.now() - timerStart);
+  timerSetMsg(`审核完成，共发现 ${findingCount} 处问题`);
+}
+
+// ---------- 上传 ----------
+['dragenter','dragover'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('dragging'); }));
+['dragleave','drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('dragging'); }));
+dropZone.addEventListener('drop', e => { if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+$('#reset-btn').addEventListener('click', () => location.reload());
+
+// ---------- 筛选 ----------
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentFilter = btn.dataset.filter;
+    document.querySelectorAll('.filter-btn').forEach(b => {
+      const on = b === btn;
+      b.classList.toggle('bg-accent', on);
+      b.classList.toggle('text-white', on);
+      b.classList.toggle('pill', !on);
+    });
+    renderFindings();
+  });
+});
+document.querySelector('.filter-btn[data-filter="all"]').click();
+
+// ---------- 跳转 ----------
+$('#jump-btn').addEventListener('click', () => {
+  const n = parseInt($('#jump-input').value);
+  if (n > 0) jumpToLine(n);
+});
+$('#jump-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('#jump-btn').click(); });
+
+// ---------- 样例文件 ----------
+async function loadSamples() {
+  try {
+    const resp = await fetch('/samples');
+    const { samples } = await resp.json();
+    const list = $('#samples-list');
+    if (!samples || samples.length === 0) {
+      $('#samples-block').classList.add('hidden');
+      return;
+    }
+    list.innerHTML = samples.map(s => `
+      <button class="sample-card w-full" data-name="${escape(s.name)}">
+        <div class="sample-icon">PDF</div>
+        <div class="sample-text">
+          <div class="sample-title">${escape(s.title || s.name)}</div>
+          <div class="sample-meta">${s.section_count} 章 · ${s.char_count.toLocaleString()} 字符${s.subtitle ? ' · ' + escape(s.subtitle) : ''}</div>
+        </div>
+        <span class="sample-arrow">→</span>
+      </button>
+    `).join('');
+    list.querySelectorAll('.sample-card').forEach(btn => {
+      btn.addEventListener('click', () => useSample(btn.dataset.name, btn.querySelector('.sample-title').textContent));
+    });
+  } catch (e) {
+    $('#samples-block').classList.add('hidden');
+  }
+}
+
+async function useSample(name, title) {
+  // 模拟 handleFile 流程，但调 /use-sample 不上传
+  timerStart_();
+  timerSetMsg('已选样例：' + title);
+  $('#upload-idle').classList.add('hidden');
+  $('#upload-loading').classList.remove('hidden');
+  $('#upload-loading-title').textContent = '加载样例…';
+  $('#upload-loading-sub').textContent = '已预 OCR，跳过上传，直接审核';
+  $('#stage-label').textContent = '加载样例…';
+
+  let meta;
+  try {
+    const resp = await fetch(`/use-sample?name=${encodeURIComponent(name)}`, { method: 'POST' });
+    if (!resp.ok) throw new Error(await resp.text());
+    meta = await resp.json();
+  } catch (e) {
+    $('#upload-idle').classList.remove('hidden');
+    $('#upload-loading').classList.add('hidden');
+    alert('加载样例失败：' + e.message);
+    return;
+  }
+  timerSetMsg('样例就绪，进入审核');
+  $('#upload-page').classList.add('hidden');
+  $('#work-page').classList.remove('hidden');
+  $('#file-name-inline').textContent = `${meta.filename} · ${meta.char_count.toLocaleString()} 字符 · ${meta.section_count} 章`;
+  docFrame.src = `/html?file_id=${encodeURIComponent(meta.file_id)}`;
+  fetch(`/text?file_id=${encodeURIComponent(meta.file_id)}`).then(r => r.json()).then(d => { docLines = d.lines; });
+  docFrame.addEventListener('load', injectFrameStyles, { once: false });
+  startAudit(meta.file_id, meta.section_count);
+}
+
+loadSamples();
+
+// ---------- 主流程 ----------
+async function handleFile(file) {
+  const isPdf = file.name.toLowerCase().endsWith('.pdf');
+
+  // 计时从这里开始，上传阶段就能看到
+  timerStart_();
+  timerSetMsg(isPdf ? '收到 PDF，准备 OCR' : '开始解析文档');
+
+  // 切换到 loading 状态
+  $('#upload-idle').classList.add('hidden');
+  $('#upload-loading').classList.remove('hidden');
+  $('#upload-loading-title').textContent = isPdf ? 'PDF 识别中…' : '解析中…';
+  $('#upload-loading-sub').textContent = isPdf
+    ? '正在停止模型、启动 OCR，约需 5-8 分钟，请勿关闭页面'
+    : '正在解析文档结构，请稍候';
+  $('#stage-label').textContent = isPdf ? 'PDF 识别中…' : '上传中…';
+
+  const fd = new FormData();
+  fd.append('file', file);
+
+  // 用 XHR 拿上传进度
+  let meta;
+  try {
+    meta = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload');
+      xhr.timeout = 0;   // 不超时，PDF OCR 可能很久
+      let uploadDone = false;
+      xhr.upload.onprogress = (ev) => {
+        if (!ev.lengthComputable) return;
+        const pct = (ev.loaded / ev.total * 100).toFixed(0);
+        const mb = (ev.loaded / 1048576).toFixed(1);
+        const totalMb = (ev.total / 1048576).toFixed(1);
+        $('#upload-loading-sub').textContent = `上传中 ${pct}%（${mb} / ${totalMb} MB）`;
+        timerLatest.textContent = `上传 ${pct}%`;
+      };
+      xhr.upload.onload = () => {
+        uploadDone = true;
+        timerSetMsg('文件已传完，服务端处理中');
+        $('#upload-loading-sub').textContent = isPdf
+          ? '上传完成，正在停止模型、启动 OCR…'
+          : '上传完成，服务端解析中…';
+      };
+      xhr.upload.onerror = () => reject(new Error('上传中网络中断'));
+      xhr.onerror = () => reject(new Error('网络错误（连接被重置）'));
+      xhr.ontimeout = () => reject(new Error('上传超时'));
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(xhr.responseText)); }
+          catch (e) { reject(new Error('返回格式错误：' + xhr.responseText.slice(0, 200))); }
+        } else {
+          reject(new Error(`服务端返回 ${xhr.status}：${xhr.responseText.slice(0, 200)}`));
+        }
+      };
+      xhr.send(fd);
+    });
+  } catch (e) {
+    // 恢复 idle 状态
+    $('#upload-idle').classList.remove('hidden');
+    $('#upload-loading').classList.add('hidden');
+    timerSetMsg('失败：' + e.message);
+    alert('上传失败：' + e.message);
+    $('#stage-label').textContent = '失败';
+    return;
+  }
+  $('#upload-page').classList.add('hidden');
+  $('#work-page').classList.remove('hidden');
+  $('#file-name-inline').textContent = `${meta.filename} · ${meta.char_count.toLocaleString()} 字符 · ${meta.section_count} 章`;
+
+  // 同时加载：原始 HTML 进 iframe；纯文本用于跳转校验
+  docFrame.src = `/html?file_id=${encodeURIComponent(meta.file_id)}`;
+  fetch(`/text?file_id=${encodeURIComponent(meta.file_id)}`).then(r => r.json()).then(d => {
+    docLines = d.lines;
+  });
+  // iframe 加载完后注入跳转高亮样式
+  docFrame.addEventListener('load', injectFrameStyles, { once: false });
+
+  startAudit(meta.file_id, meta.section_count);
+}
+
+function injectFrameStyles() {
+  try {
+    const doc = docFrame.contentDocument;
+    if (!doc) return;
+    if (doc.getElementById('__hl_style')) return;
+    const style = doc.createElement('style');
+    style.id = '__hl_style';
+    style.textContent = `
+      [data-line].__hl { outline: 2px solid #C76A3A !important; outline-offset: 2px; background: #FAF1DE !important; transition: background .3s ease; }
+      [data-line].__flash { animation: __flash 1.2s ease; }
+      @keyframes __flash {
+        0%   { background: rgba(199,106,58,0.45) !important; }
+        100% { background: #FAF1DE !important; }
+      }
+      body { padding: 16px 24px !important; }
+    `;
+    doc.head.appendChild(style);
+  } catch (e) { /* cross-origin? 本地无影响 */ }
+}
+
+function startAudit(fileId, totalSections) {
+  $('#stage-label').textContent = '审核中…';
+  timerSetMsg('文档解析完成，开始审核');   // 不重置计时，接着上传阶段往下记
+  const es = new EventSource(`/audit?file_id=${encodeURIComponent(fileId)}`);
+  es.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'stage') {
+      $('#stage-label').textContent = msg.msg;
+      timerSetMsg(msg.msg);
+    } else if (msg.type === 'baseline') {
+      baselineSummary = msg.summary || '';
+      $('#stage-label').textContent = `基线已建立（${msg.length} 字）`;
+      timerSetMsg('基线提取完成');
+    } else if (msg.type === 'finding') {
+      addFinding(msg.data, msg.source);
+      findingCount++;
+    } else if (msg.type === 'progress') {
+      const pct = (msg.done / msg.total * 100).toFixed(0);
+      $('#progress-bar').style.width = pct + '%';
+      $('#progress-text').textContent = `${msg.done}/${msg.total}`;
+      $('#stage-label').textContent = `已完成：${msg.section}`;
+      timerSetMsg(`审核第 ${msg.done}/${msg.total} 章`);
+    } else if (msg.type === 'done') {
+      $('#progress-bar').style.width = '100%';
+      $('#stage-label').textContent = '审核完成';
+      timerFinish();
+      es.close();
+    }
+  };
+  es.onerror = () => {
+    $('#stage-label').textContent = '连接中断';
+    timerSetMsg('连接中断');
+    es.close();
+  };
+}
+
+function addFinding(f, source) {
+  f.__source = source;
+  f.__id = 'f' + allFindings.length;
+  allFindings.push(f);
+  sourceCount[source] = (sourceCount[source] || 0) + 1;
+  updateStats();
+  renderFindings();
+}
+
+function updateStats() {
+  $('#stat-total').textContent = allFindings.length;
+  $('#stat-high').textContent = allFindings.filter(f => f.severity === 'high').length;
+  $('#stat-medium').textContent = allFindings.filter(f => f.severity === 'medium').length;
+  $('#stat-low').textContent = allFindings.filter(f => f.severity === 'low').length;
+  $('#source-stats').textContent = `规则 ${sourceCount.rule || 0} · 审读 ${sourceCount.llm || 0} · 跨章节 ${sourceCount.cross || 0}`;
+}
+
+function severityLabel(s) { return { high: '严重', medium: '中等', low: '轻微' }[s] || s; }
+function sourceLabel(s) { return { rule: '规则核查', llm: '智能审读', cross: '跨章节比对' }[s] || s; }
+
+function renderFields(f) {
+  // 优先用四段式（standard_ref / required / actual / suggestion）；缺字段时回退到 problem
+  const rows = [];
+  if (f.standard_ref) rows.push(['依据', f.standard_ref, 'serif']);
+  if (f.required)     rows.push(['要求', f.required, '']);
+  if (f.actual)       rows.push(['现状', f.actual, '']);
+  // 没有 required/actual 但有 problem 的旧 finding 兼容
+  if (!f.required && !f.actual && f.problem) rows.push(['问题', f.problem, '']);
+  if (f.suggestion)   rows.push(['建议', f.suggestion, 'accent']);
+
+  return rows.map(([label, val, cls]) => `
+    <div class="text-[12px] leading-relaxed mb-1 flex gap-1.5">
+      <span class="shrink-0 ${cls === 'accent' ? 'accent font-medium' : ''}" style="color: ${cls === 'accent' ? '' : 'var(--ink-soft)'}; min-width: 30px;">${label}</span>
+      <span class="${cls === 'serif' ? 'serif' : ''}" style="color: var(--ink);">${escape(val)}</span>
+    </div>
+  `).join('');
+}
+
+function renderFindings() {
+  const filtered = currentFilter === 'all' ? allFindings : allFindings.filter(f => f.severity === currentFilter);
+  const order = { high: 0, medium: 1, low: 2 };
+  const sorted = [...filtered].sort((a, b) => {
+    const d = (order[a.severity] ?? 9) - (order[b.severity] ?? 9);
+    if (d !== 0) return d;
+    return (a.line_no ?? 99999) - (b.line_no ?? 99999);
+  });
+
+  if (sorted.length === 0) {
+    findingsEl.innerHTML = '';
+    $('#empty-hint').classList.toggle('hidden', allFindings.length === 0);
+    return;
+  }
+  $('#empty-hint').classList.add('hidden');
+
+  findingsEl.innerHTML = sorted.map((f) => `
+    <div class="card finding-card rounded-lg p-3 fade-in ${activeFinding === f.__id ? 'active' : ''}" data-fid="${f.__id}">
+      <div class="flex items-center gap-1.5 mb-2 text-[10px]">
+        <span class="severity-${f.severity} px-1.5 py-0.5 rounded border font-medium">${severityLabel(f.severity)}</span>
+        <span class="pill px-1.5 py-0.5 rounded">${escape(f.category || '')}</span>
+        <span class="pill px-1.5 py-0.5 rounded">${sourceLabel(f.__source)}</span>
+        ${f.line_no ? `<span class="ml-auto accent font-medium">第 ${f.line_no} 行</span>` : `<span class="ml-auto opacity-50 truncate" style="max-width: 140px;">${escape(f.location || '')}</span>`}
+      </div>
+      ${f.original ? `<div class="mono text-[11px] p-1.5 mb-2 rounded leading-relaxed" style="background: var(--bg-soft); color: var(--ink-soft); border-left: 2px solid var(--line);">${escape(truncate(f.original, 100))}</div>` : ''}
+      ${renderFields(f)}
+    </div>
+  `).join('');
+
+  // 绑定点击跳转
+  findingsEl.querySelectorAll('.finding-card').forEach(el => {
+    el.addEventListener('click', () => {
+      const fid = el.dataset.fid;
+      const f = allFindings.find(x => x.__id === fid);
+      activeFinding = fid;
+      // 重新渲染以更新 active 样式
+      findingsEl.querySelectorAll('.finding-card').forEach(e => e.classList.toggle('active', e === el));
+      if (f.line_no) {
+        jumpToLine(f.line_no);
+      } else if (f.original) {
+        // 用 original 搜
+        const idx = findLineByText(f.original);
+        if (idx >= 0) jumpToLine(idx + 1);
+      }
+    });
+  });
+}
+
+function findLineByText(needle) {
+  const short = needle.trim().slice(0, 20);
+  if (short.length < 5) return -1;
+  for (let i = 0; i < docLines.length; i++) {
+    if (docLines[i].includes(short)) return i;
+  }
+  return -1;
+}
+
+function jumpToLine(n) {
+  injectFrameStyles();
+  const doc = docFrame.contentDocument;
+  if (!doc) return;
+  // 清掉之前高亮
+  doc.querySelectorAll('[data-line].__hl, [data-line].__flash').forEach(el => {
+    el.classList.remove('__hl', '__flash');
+  });
+  const target = doc.querySelector(`[data-line="${n}"]`);
+  if (!target) return;
+  target.classList.add('__hl', '__flash');
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function truncate(s, n) { return s.length > n ? s.slice(0, n) + '…' : s; }
+function escape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+
+</body>
+</html>

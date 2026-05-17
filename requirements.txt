@@ -1,0 +1,12 @@
+fastapi>=0.136.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+python-docx>=1.1.2
+markdown>=3.7
+beautifulsoup4>=4.12
+lxml>=5.3
+# LLM 后端二选一（按需安装）：
+#   claude  → claude-agent-sdk    （走本地 Claude Code）
+#   openai  → openai              （走 vLLM / OpenRouter / 任意 OpenAI 兼容端点）
+claude-agent-sdk>=0.1.6
+openai>=1.50

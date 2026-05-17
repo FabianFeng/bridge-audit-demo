@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# 运行时产物
+samples/
+/tmp/
+*.log
+audit_*.json
+audit_*.txt
+
+# 客户上传的真实文件（不入库）
+*.pdf
+*.doc
+*.docx
+!sample_*.pdf
+
+# 本地配置
+.env
+*.local
