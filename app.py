@@ -1,7 +1,7 @@
 """
 桥梁设计文档审核 demo
-- 上传 .doc / .docx / .txt
-- 后端：规则层（正则）+ LLM 层（带 prompt cache 的 Claude API）
+- 上传 .doc / .docx / .txt / .md / .pdf
+- 后端：规则层（正则）+ LLM 层（OpenAI 兼容端点，本地 vLLM 部署 Gemma-31B）
 - 前端通过 SSE 实时收到 findings
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from threading import Thread
 
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -24,27 +26,29 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 from rules import quick_scan, standards_index
 
+# 配置日志：写入文件和控制台
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/data/demo_debug.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 app = FastAPI()
 
 
-# ---------- LLM 后端配置（claude / openai 二选一） ----------
-# claude   = 走本地 Claude Code（Claude Agent SDK），无需 API key
-# openai   = 走 OpenAI 兼容端点（vLLM / OpenRouter / 自建），需 LLM_BASE_URL + LLM_MODEL
-LLM_BACKEND = os.getenv("LLM_BACKEND", "claude").lower()
+# ---------- LLM 后端配置（OpenAI 兼容端点 → 本地 vLLM）----------
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "dummy")  # vLLM 不校验
-LLM_MODEL = os.getenv(
-    "LLM_MODEL",
-    "claude-sonnet-4-6" if LLM_BACKEND == "claude" else "nvidia/Gemma-4-31B-IT-NVFP4",
-)
+LLM_MODEL = os.getenv("LLM_MODEL", "nvidia/Gemma-4-31B-IT-NVFP4")
 
-if LLM_BACKEND == "claude":
-    from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock
-else:
-    from openai import AsyncOpenAI
+from openai import AsyncOpenAI
 
-print(f"[LLM 后端] backend={LLM_BACKEND} | model={LLM_MODEL} | url={LLM_BASE_URL if LLM_BACKEND=='openai' else '(Claude Code)'}")
+print(f"[LLM 后端] model={LLM_MODEL} | url={LLM_BASE_URL}")
 
 _openai_client = None
 def _get_openai_client():
@@ -68,29 +72,80 @@ _MINERU_BIN = "/data/venvs/mineru/bin/mineru"
 
 
 def _vllm_stop():
-    subprocess.run(["tmux", "kill-session", "-t", "vllm"], capture_output=True)
-    time.sleep(3)
+    """彻底停止 vLLM。
+    注意：`vllm serve` 用多进程方式起 worker（命令名是 VLLM::Worker_TP0/TP1），
+    单独 pkill 'vllm serve' 会留下占着 GPU 显存的 worker，导致后续启动 OOM。
+    所以这里要同时清理两类进程，并等 GPU 内存释放。
+    """
+    logger.info("Stopping vLLM (serve + workers)...")
+    subprocess.run(["pkill", "-9", "-f", "vllm serve"], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", "VLLM"], capture_output=True)  # worker 子进程
+    # 等 GPU 内存释放完
+    for _ in range(20):
+        time.sleep(1)
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3,
+            )
+            used = max(int(x.strip()) for x in r.stdout.strip().splitlines() if x.strip())
+            if used < 500:  # < 500 MiB 表示已释放
+                logger.info(f"GPU memory released (used={used} MiB)")
+                return
+        except Exception:
+            pass
+    logger.warning("GPU memory not released after 20s, continuing anyway")
 
 
 def _vllm_start_and_wait(timeout: int = 300):
-    subprocess.Popen(["tmux", "new-session", "-d", "-s", "vllm", _VLLM_CMD],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    logger.info("Starting vLLM...")
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0,1"
+    # 把 venv 的 bin 加到 PATH 头部，等同于 source activate
+    env["PATH"] = "/data/venvs/vllm/bin:" + env.get("PATH", "")
+    env["VIRTUAL_ENV"] = "/data/venvs/vllm"
+
+    # 用 vllm 绝对路径启动（避免 dash 不支持 source 的问题）
+    # served-model-name 必须与 LLM_MODEL 一致，否则 demo 调用会因 model id 不匹配而 404
+    cmd = [
+        "/data/venvs/vllm/bin/vllm", "serve",
+        "/data/models/gemma-4-31b-nvfp4",
+        "--served-model-name", LLM_MODEL,
+        "--quantization", "modelopt",
+        "--tensor-parallel-size", "2",
+        "--max-model-len", "131072",
+        "--max-num-batched-tokens", "4096",
+        "--host", "127.0.0.1", "--port", "8000",
+    ]
+    # 输出重定向到 vllm.log，便于排查
+    vllm_log = open("/data/vllm.log", "ab", buffering=0)
+    vllm_log.write(f"\n=== vLLM start at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
+    proc = subprocess.Popen(
+        cmd, env=env, stdout=vllm_log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    logger.info(f"vLLM process started with PID {proc.pid}")
+
+    # 轮询直到 vLLM 就绪
     deadline = time.time() + timeout
+    attempts = 0
     while time.time() < deadline:
+        attempts += 1
         try:
-            urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=3)
+            response = urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=3)
+            logger.info(f"vLLM ready after {attempts} attempts")
             return  # 就绪
-        except Exception:
+        except Exception as e:
+            if attempts <= 3 or attempts % 10 == 0:
+                logger.debug(f"vLLM not ready yet (attempt {attempts}): {type(e).__name__}")
             time.sleep(5)
-    raise RuntimeError("vLLM 重启超时，请手动检查 tmux:vllm")
+
+    logger.error(f"vLLM startup timeout after {attempts} attempts")
+    raise RuntimeError("vLLM 重启超时，请手动检查日志 /data/vllm.log")
 
 
 def _pdf_to_markdown(pdf_path: Path) -> str:
-    """停 vLLM → MinerU OCR → 重启 vLLM → 返回 markdown
-    实测命令（必须传 MINERU_MODEL_SOURCE=modelscope，否则会去 HF 拉 unimernet）：
-      MINERU_MODEL_SOURCE=modelscope mineru \\
-        -p input.pdf -o output_dir --backend pipeline --method ocr --lang ch
-    输出路径：{output_dir}/{stem}/ocr/{stem}.md
+    """MinerU OCR（不停止 vLLM，共享 GPU 显存）
     """
     if not Path(_MINERU_BIN).exists():
         raise RuntimeError(f"MinerU 未安装：{_MINERU_BIN}")
@@ -98,20 +153,17 @@ def _pdf_to_markdown(pdf_path: Path) -> str:
     out_dir = pdf_path.parent / (pdf_path.stem + "_mu")
     out_dir.mkdir(exist_ok=True)
 
-    _vllm_stop()
-    try:
-        env = os.environ.copy()
-        env["MINERU_MODEL_SOURCE"] = "modelscope"
-        r = subprocess.run(
-            [_MINERU_BIN, "-p", str(pdf_path), "-o", str(out_dir),
-             "--backend", "pipeline", "--method", "ocr", "--lang", "ch"],
-            capture_output=True, text=True, timeout=1800, env=env,
-        )
-        if r.returncode != 0:
-            tail = (r.stderr or r.stdout or "")[-600:]
-            raise RuntimeError(f"MinerU 退出码 {r.returncode}：{tail}")
-    finally:
-        _vllm_start_and_wait()
+    env = os.environ.copy()
+    env["MINERU_MODEL_SOURCE"] = "modelscope"
+    env["CUDA_VISIBLE_DEVICES"] = "0,1"
+    r = subprocess.run(
+        [_MINERU_BIN, "-p", str(pdf_path), "-o", str(out_dir),
+         "--backend", "pipeline", "--method", "ocr", "--lang", "ch"],
+        capture_output=True, text=True, timeout=1800, env=env,
+    )
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "")[-600:]
+        raise RuntimeError(f"MinerU 退出码 {r.returncode}：{tail}")
 
     # 优先按 MinerU 标准输出路径找
     expected = out_dir / pdf_path.stem / "ocr" / f"{pdf_path.stem}.md"
@@ -429,26 +481,9 @@ CROSS_CHECK_PROMPT = f"""你是公路工程设计文件审校专家。
 SYSTEM_PROMPT = SYSTEM_PROMPT_BASE.replace("{BASELINE}", "（基线尚未抽取，按通用要点审核）")
 
 
-async def _llm_call_claude(system_prompt: str, user_msg: str) -> str:
-    """走本地 Claude Code（Agent SDK）"""
-    options = ClaudeAgentOptions(
-        model=LLM_MODEL,
-        system_prompt=system_prompt,
-        allowed_tools=[],
-        max_turns=1,
-    )
-    chunks: list[str] = []
-    async for msg in query(prompt=user_msg, options=options):
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    chunks.append(block.text)
-    return "".join(chunks).strip()
-
-
-async def _llm_call_openai(system_prompt: str, user_msg: str, max_tokens: int = 2048) -> str:
-    """走 OpenAI 兼容端点（vLLM 等）。
-    max_tokens 默认 2048。超长输入场景（cross_check）由调用方降到 1024。
+async def _llm_call(system_prompt: str, user_msg: str, max_tokens: int = 2048) -> str:
+    """调用 vLLM（OpenAI 兼容）。
+    max_tokens 默认 2048；超长输入场景（cross_check）由调用方降到 1024。
     """
     client = _get_openai_client()
     resp = await client.chat.completions.create(
@@ -459,17 +494,9 @@ async def _llm_call_openai(system_prompt: str, user_msg: str, max_tokens: int = 
         ],
         temperature=0.2,
         max_tokens=max_tokens,
-        # vLLM / Qwen 关 thinking 模式（如果模型支持）
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     return (resp.choices[0].message.content or "").strip()
-
-
-async def _llm_call(system_prompt: str, user_msg: str, max_tokens: int = 2048) -> str:
-    """通用 LLM 调用：自动按 LLM_BACKEND 路由"""
-    if LLM_BACKEND == "openai":
-        return await _llm_call_openai(system_prompt, user_msg, max_tokens=max_tokens)
-    return await _llm_call_claude(system_prompt, user_msg)
 
 
 def _parse_findings(raw: str) -> list[dict]:
@@ -541,8 +568,8 @@ async def audit_section(title: str, body: str, line_no: int, baseline: str = "")
             "category": "审读失败",
             "location": title,
             "original": "",
-            "problem": f"调用失败：{e}",
-            "suggestion": "请确认本地已登录 Claude Code（claude /login）",
+            "problem": f"调用失败：{type(e).__name__}: {str(e)[:160]}",
+            "suggestion": f"检查 vLLM 是否在线（{LLM_BASE_URL}）及模型 id（{LLM_MODEL}）是否匹配；本章节跳过，其它章节不受影响",
         }]
 
     items = _parse_findings(text)
@@ -603,27 +630,30 @@ def _repair_inner_quotes(text: str) -> str:
 
 # ---------- 行号定位 ----------
 
-def locate_line(needle: str, full_text: str) -> int | None:
-    """在全文中查找 needle 出现的第一个行号（1-based）"""
-    if not needle or len(needle) < 4:
+def locate_line(needle: str, full_text: str, hint_line: int | None = None) -> int | None:
+    """在全文中查找 needle 出现的行号（1-based）。
+    hint_line：LLM 给的猜测行号；如果 needle 在文档里多次出现，挑离 hint 最近的那个。
+    """
+    if not needle or len(needle) < 3:
         return None
     needle = needle.strip().replace("\n", "").replace("\r", "")
-    # 直接搜
-    idx = full_text.replace("\n", " ").find(needle)
-    if idx >= 0:
-        # 用原始 text（带换行）重新搜短一点的片段算行号
-        # 简化：用前 20 字符在 raw 里搜
-        short = needle[:20]
-        idx2 = full_text.find(short)
-        if idx2 >= 0:
-            return full_text[:idx2].count("\n") + 1
-    # 退化：用前 12 字符直接搜
-    short = needle[:12]
-    if len(short) >= 6:
-        idx = full_text.find(short)
-        if idx >= 0:
-            return full_text[:idx].count("\n") + 1
-    return None
+    lines = full_text.split("\n")
+
+    # 1) 长 needle 直接整段搜，找到的所有命中行号
+    hits: list[int] = []
+    for length in (len(needle), 20, 12, 8):
+        if length < 4:
+            break
+        short = needle[:length]
+        hits = [i + 1 for i, ln in enumerate(lines) if short in ln]
+        if hits:
+            break
+    if not hits:
+        return None
+    if hint_line is None:
+        return hits[0]
+    # 多个命中：挑离 hint 最近的那个
+    return min(hits, key=lambda x: abs(x - hint_line))
 
 
 _LINE_NO_PATTERN = re.compile(r"第\s*(\d+)\s*行")
@@ -638,13 +668,18 @@ def extract_line_no(location: str) -> int | None:
 
 
 def enrich_finding(f: dict, full_text: str) -> dict:
-    """给 finding 补上 line_no 字段"""
-    if "line_no" in f:
+    """给 finding 补上 line_no 字段。
+    优先用 original 在全文里精确匹配（可靠），LLM 给的「第 N 行」只作为 hint：
+    - original 找到唯一/多个命中：用 hint 挑最近的
+    - original 找不到：退到用 hint 当行号（不可靠，但好过没有）
+    """
+    if "line_no" in f and f["line_no"]:
         return f
-    # 优先从 location 提取
-    ln = extract_line_no(f.get("location", ""))
+    hint = extract_line_no(f.get("location", ""))
+    original = (f.get("original") or "").strip()
+    ln = locate_line(original, full_text, hint_line=hint) if original else None
     if ln is None:
-        ln = locate_line(f.get("original", ""), full_text)
+        ln = hint  # 兜底
     f["line_no"] = ln
     return f
 
@@ -679,44 +714,275 @@ SAMPLE_DISPLAY = {
         "title": "桥梁设计说明（3页摘录）",
         "subtitle": "甬金衢上高速 · 浙江金华 · 已预 OCR，点击直接审核",
     },
-    "bridge_full": {
-        "title": "桥梁设计说明（完整 203 页）",
-        "subtitle": "甬金衢上高速 · 完整文档 · 已预 OCR，点击直接审核",
+    "highway_施工图总说明": {
+        "title": "高速施工图总说明（完整 PDF）",
+        "subtitle": "甬金衢上高速 · 41MB · 点击体验完整 OCR+审核流程（耗时展示）",
+        "is_pdf": True,
     },
 }
+
+# --------- 异步 PDF 处理队列 ---------
+PDF_TASKS = {}  # {task_id: {"status": "processing|done", "file_id": "...", "progress": 0-100}}
+PDF_TASK_COUNTER = 0
+
+def _generate_task_id():
+    global PDF_TASK_COUNTER
+    PDF_TASK_COUNTER += 1
+    return f"pdf_task_{PDF_TASK_COUNTER}_{int(time.time())}"
+
+
+@app.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    """查询 PDF 处理进度。
+    返回字段：
+      status: processing | done | error
+      stage:  人话阶段描述（如「MinerU OCR ...」）
+      stage_elapsed: 当前阶段已耗时（秒）
+      total_elapsed: 任务总耗时（秒）
+      progress: 估算 0-99 区间的进度（按经验时长推算，不精确，只为让进度条能动）
+    """
+    if task_id not in PDF_TASKS:
+        raise HTTPException(404, "任务不存在")
+    task = PDF_TASKS[task_id]
+    if task["status"] == "done":
+        text = parse_doc_to_text(UPLOAD_DIR / task["file_id"])
+        return {
+            "status": "done",
+            "file_id": task["file_id"],
+            "char_count": len(text),
+            "section_count": len(split_sections(text)),
+        }
+    now = time.time()
+    total_elapsed = int(now - task.get("task_started", now))
+    stage_elapsed = int(now - task.get("stage_started", now))
+    # 阶段内线性插值：进度 = stage_begin% + (stage_elapsed / stage_expect) * (stage_end% - stage_begin%)
+    # 在该阶段内不超过 stage_end%（哪怕实际比预期慢，也卡在阶段终点），等切到下一阶段再继续涨
+    begin = task.get("stage_begin_pct", 0)
+    end = task.get("stage_end_pct", 99)
+    expect = max(1, task.get("stage_expect_sec", 60))
+    ratio = min(1.0, stage_elapsed / expect)
+    progress = min(99, int(begin + (end - begin) * ratio))
+    return {
+        "status": task["status"],
+        "stage": task.get("stage", ""),
+        "stage_elapsed": stage_elapsed,
+        "total_elapsed": total_elapsed,
+        "stage_expect_sec": int(task.get("stage_expect_sec", 0)),
+        "total_expect_sec": int(task.get("total_expect_sec") or 0),
+        "pages": task.get("pages"),
+        "progress": progress,
+        "error": task.get("error"),
+    }
+
+
+def _has_active_pdf_task() -> bool:
+    """是否有正在跑的 PDF 处理任务（用于拒绝并发触发）"""
+    return any(t.get("status") == "processing" for t in PDF_TASKS.values())
+
+
+@app.post("/reset")
+async def reset():
+    """重置：手动停掉所有正在跑的 OCR / vLLM 重启任务，清空任务队列，
+    然后异步重启 vLLM。前端在用户连点样例/上传卡住时调用这个。
+    """
+    logger.info("=== /reset 触发 ===")
+    killed = {"mineru": 0, "vllm": 0, "tasks_dropped": 0}
+
+    # 1) 杀 MinerU（OCR）
+    r1 = subprocess.run(["pkill", "-9", "-f", "mineru"], capture_output=True)
+    killed["mineru"] = 1 if r1.returncode == 0 else 0
+    logger.info(f"reset: pkill mineru returncode={r1.returncode}")
+
+    # 2) 杀 vLLM（含 worker 子进程）
+    subprocess.run(["pkill", "-9", "-f", "vllm serve"], capture_output=True)
+    r2 = subprocess.run(["pkill", "-9", "-f", "VLLM"], capture_output=True)
+    killed["vllm"] = 1 if r2.returncode == 0 else 0
+    logger.info(f"reset: pkill vllm returncode={r2.returncode}")
+
+    # 3) 清空任务字典（前端不再轮询到 processing 状态）
+    killed["tasks_dropped"] = len(PDF_TASKS)
+    PDF_TASKS.clear()
+
+    # 4) 异步重启 vLLM（不阻塞响应；前端无需等待）
+    def _bg_restart():
+        try:
+            # 等 GPU 显存释放完
+            for _ in range(20):
+                time.sleep(1)
+                try:
+                    r = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    used = max(int(x.strip()) for x in r.stdout.strip().splitlines() if x.strip())
+                    if used < 500:
+                        break
+                except Exception:
+                    pass
+            _vllm_start_and_wait()
+            logger.info("reset: vLLM 后台重启成功")
+        except Exception as e:
+            logger.warning(f"reset: vLLM 后台重启失败 {e}")
+
+    Thread(target=_bg_restart, daemon=True).start()
+
+    return {"ok": True, "killed": killed, "vllm_restart": "background"}
 
 
 @app.get("/samples")
 async def list_samples():
-    """列出可用样例文件（无需上传，已预 OCR）"""
+    """列出可用样例文件（.md 预 OCR，.pdf 点击即 OCR）"""
     items = []
     if SAMPLES_DIR.exists():
+        # MD 文件（已预 OCR）
         for md in sorted(SAMPLES_DIR.glob("*.md")):
             meta = _sample_meta(md.stem)
             if meta is None:
                 continue
             disp = SAMPLE_DISPLAY.get(md.stem, {})
             items.append({**meta, **disp})
+        # PDF 文件（点击即 OCR）
+        for pdf in sorted(SAMPLES_DIR.glob("*.pdf")):
+            stem = pdf.stem
+            disp = SAMPLE_DISPLAY.get(stem, {})
+            if not disp:
+                continue
+            items.append({
+                "name": stem,
+                "file_id": stem,
+                "filename": disp.get("title", stem),
+                "char_count": 0,
+                "section_count": 0,
+                "title": disp.get("title", stem),
+                "subtitle": disp.get("subtitle", ""),
+                **disp
+            })
     return {"samples": items}
 
 
 @app.post("/use-sample")
 async def use_sample(name: str):
-    """选用样例：把样例 md 拷到 upload 目录，返回 file_id"""
-    src = SAMPLES_DIR / f"{name}.md"
-    if not src.exists():
-        raise HTTPException(404, f"样例不存在：{name}")
-    file_id = f"sample_{name}.md"
-    dest = UPLOAD_DIR / file_id
-    shutil.copyfile(src, dest)
-    text = parse_doc_to_text(dest)
+    """选用样例：.md 直接拷贝，.pdf 则异步触发 OCR"""
     disp = SAMPLE_DISPLAY.get(name, {})
-    return {
-        "file_id": file_id,
-        "filename": disp.get("title", name + ".md"),
-        "char_count": len(text),
-        "section_count": len(split_sections(text)),
-    }
+    is_pdf = disp.get("is_pdf", False)
+
+    if is_pdf:
+        # 防并发：已有正在跑的 PDF 任务时拒绝，避免多个 _vllm_stop/start 争抢资源
+        if _has_active_pdf_task():
+            raise HTTPException(
+                409,
+                "已有 OCR 任务在跑，请等任务完成或点「重置」后再试。",
+            )
+        # PDF 样例：异步 OCR，返回 task_id
+        src = SAMPLES_DIR / f"{name}.pdf"
+        if not src.exists():
+            raise HTTPException(404, f"样例不存在：{name}")
+
+        raw_id = f"sample_{name}.pdf"
+        dest = UPLOAD_DIR / raw_id
+        shutil.copyfile(src, dest)
+
+        file_id = f"sample_{name}.md"
+        task_id = _generate_task_id()
+        PDF_TASKS[task_id] = {
+            "status": "processing",
+            "file_id": file_id,
+            "stage": "排队中",
+            "stage_started": time.time(),
+            "task_started": time.time(),
+            "stage_begin_pct": 0,
+            "stage_end_pct": 1,
+            "stage_expect_sec": 1,
+            "pages": None,           # 真实页数（后台数完填）
+            "total_expect_sec": None,  # 任务总预期时长（数完页数算出）
+            "pdf_path": str(dest),
+        }
+
+        def _set_stage(label: str, expect_sec: float, end_pct: int):
+            """切到下一个阶段。expect_sec=该阶段预期耗时；end_pct=该阶段结束时累计百分比。"""
+            t = PDF_TASKS[task_id]
+            t["stage_begin_pct"] = t.get("stage_end_pct", 0)
+            t["stage_end_pct"] = end_pct
+            t["stage_expect_sec"] = max(1, expect_sec)
+            t["stage"] = label
+            t["stage_started"] = time.time()
+            logger.info(f"[{task_id}] stage → {label} (expect {expect_sec:.0f}s, end {end_pct}%)")
+
+        # 后台异步处理（不阻塞）
+        def _process_pdf():
+            logger.info(f"[{task_id}] Starting PDF processing for {name}")
+            try:
+                # ---- Step 0: 数页数（决定 OCR 预期耗时）----
+                _set_stage("分析 PDF（数页数）", expect_sec=3, end_pct=2)
+                try:
+                    import pdfplumber
+                    with pdfplumber.open(dest) as pdf:
+                        pages = len(pdf.pages)
+                except Exception as e:
+                    logger.warning(f"[{task_id}] 数页数失败 {e}，按 100 页估算")
+                    pages = 100
+
+                # ---- 各阶段预期耗时（秒）----
+                # OCR：经验值 GPU 加速 ~1.8 秒/页
+                STOP_SEC, OCR_SEC, WRITE_SEC, VLLM_SEC = 5, pages * 1.8, 1, 90
+                total = STOP_SEC + OCR_SEC + WRITE_SEC + VLLM_SEC
+                PDF_TASKS[task_id]["pages"] = pages
+                PDF_TASKS[task_id]["total_expect_sec"] = total
+                logger.info(f"[{task_id}] pages={pages} total≈{total:.0f}s")
+
+                # 各阶段终点 % = 累加耗时占总耗时比例（从 2% 开始）
+                stop_end = 2 + int(STOP_SEC / total * 97)
+                ocr_end = stop_end + int(OCR_SEC / total * 97)
+                write_end = ocr_end + int(WRITE_SEC / total * 97)
+                vllm_end = 99
+
+                _set_stage("停止 vLLM 释放显存", expect_sec=STOP_SEC, end_pct=stop_end)
+                _vllm_stop()
+
+                _set_stage(f"MinerU OCR（{pages} 页 · 预计 {int(OCR_SEC)} 秒）",
+                           expect_sec=OCR_SEC, end_pct=ocr_end)
+                md_text = _pdf_to_markdown(dest)
+                logger.info(f"[{task_id}] MinerU OCR done, {len(md_text)} chars")
+
+                _set_stage("写入 markdown", expect_sec=WRITE_SEC, end_pct=write_end)
+                (UPLOAD_DIR / file_id).write_text(md_text, encoding="utf-8")
+
+                # 必须等 vLLM 真就绪才标 done，否则用户撞进模型加载空窗期
+                _set_stage("模型预热",
+                           expect_sec=VLLM_SEC, end_pct=vllm_end)
+                _vllm_start_and_wait()
+                logger.info(f"[{task_id}] vLLM ready, marking task done")
+
+                PDF_TASKS[task_id].update({"status": "done"})
+
+            except Exception as e:
+                logger.error(f"[{task_id}] Processing failed: {type(e).__name__}: {e}")
+                PDF_TASKS[task_id].update({"status": "error", "error": str(e)})
+
+        logger.info(f"[{task_id}] Spawning background thread for PDF processing")
+        Thread(target=_process_pdf, daemon=True).start()
+
+        return {
+            "task_id": task_id,
+            "status": "processing",
+            "filename": disp.get("title", name),
+        }
+    else:
+        # MD 样例：直接拷贝
+        src = SAMPLES_DIR / f"{name}.md"
+        if not src.exists():
+            raise HTTPException(404, f"样例不存在：{name}")
+        file_id = f"sample_{name}.md"
+        dest = UPLOAD_DIR / file_id
+        shutil.copyfile(src, dest)
+
+        text = parse_doc_to_text(dest)
+        return {
+            "file_id": file_id,
+            "filename": disp.get("title", name),
+            "char_count": len(text),
+            "section_count": len(split_sections(text)),
+        }
 
 
 @app.post("/upload")
@@ -737,7 +1003,7 @@ async def upload(file: UploadFile = File(...)):
     loop = asyncio.get_event_loop()
 
     if suffix == ".pdf":
-        # PDF：阻塞约 5 分钟（MinerU + vLLM 重启），结果存为 .md
+        # PDF：MinerU OCR（后台处理，不停止 vLLM）
         md_text = await loop.run_in_executor(None, _pdf_to_markdown, dest)
         file_id = raw_id[:-4] + ".md"   # xxx.pdf → xxx.md
         (UPLOAD_DIR / file_id).write_text(md_text, encoding="utf-8")

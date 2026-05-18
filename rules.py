@@ -116,13 +116,41 @@ def _line_no(text: str, idx: int) -> int:
 
 # ---------- 规则 1：连续重复行 ----------
 
+# 表格单元格典型特征：含单位、数字、范围；不是完整句子
+_TABLE_CELL_PATTERN = re.compile(
+    r"^[\s\S]{0,80}?(?:"
+    r"[\d.×x*]+\s*(?:m|km|kg|t|%|MPa|kPa|℃|°C|km/h|m/s|cm|mm)"  # 数值+单位
+    r"|^[\d.×x*+\-/\s（）()]+$"   # 纯数字/算式
+    r"|^[A-Z\-\d]+$"               # 标号（如 BZZ-100、Q345）
+    r"|^第?[一二三四五六七八九十\d]+[级类型档]$"  # 等级标记
+    r")"
+)
+
+def _looks_like_table_cell(s: str) -> bool:
+    """判断是否像表格单元格：短文本、含数值+单位、或纯标识符。
+    表格里同一参数的「设计值」和「规范值」常常完全相同（如 2×0.75 / 2×0.75），
+    不应被当作重复行报错。
+    """
+    if len(s) > 30:
+        return False
+    # 含数字 + 单位
+    if re.search(r"\d[\d.×x*]*\s*(?:m|km|kg|t|%|MPa|kPa|℃|°C|km/h|m/s|cm|mm)", s):
+        return True
+    # 纯数字 / 算式（含括号注释）
+    if re.fullmatch(r"[\d.×x*+\-/\s（）()，,；;：:一-鿿]{1,30}", s) and re.search(r"\d", s):
+        # 必须含数字，但又允许少量汉字注释（如「3.0（包括右侧路缘带0.5）」）
+        return True
+    return False
+
+
 def find_duplicate_lines(text: str) -> list[Finding]:
     findings = []
     lines = text.split("\n")
     prev = None
     for i, line in enumerate(lines, 1):
         s = line.strip()
-        if len(s) > 10 and s == prev:
+        # 长度阈值提高到 15；同时跳过表格单元格
+        if len(s) > 15 and s == prev and not _looks_like_table_cell(s):
             findings.append(Finding(
                 severity="medium",
                 category="重复条目",
@@ -354,14 +382,42 @@ def check_wording(text: str) -> list[Finding]:
 
 # ---------- 规则 10：数字粘连（表格丢失分隔） ----------
 
-NUMBER_BLOB_PATTERN = re.compile(r"(?<![\d.])(\d{8,})(?![\d.])")
+# 抓 12 位以上连续数字。低于这个位数大多是正常字段（年份、桩号、统计编号等），噪声太大。
+NUMBER_BLOB_PATTERN = re.compile(r"(?<![\d.])(\d{12,})(?![\d.])")
+
+# 这些上下文里出现长数字，是字段值而不是表格粘连，跳过。
+_BLOB_SKIP_CONTEXT = re.compile(
+    r"电话|手机|联系方式|联系人|联系电话|邮箱|邮编|身份证|"
+    r"信用代码|统一代码|许可证|证号|账号|订单|发票|"
+    r"传真|fax|tel|mobile|qq|微信",
+    re.IGNORECASE,
+)
+
+
+def _is_phone(s: str) -> bool:
+    """11 位且 1[3-9] 开头 = 中国手机号"""
+    return len(s) == 11 and s[0] == "1" and s[1] in "3456789"
+
+
+def _is_uscc_digits(s: str) -> bool:
+    """18 位统一社会信用代码（纯数字版本，9 开头是组织机构）"""
+    return len(s) == 18
 
 
 def check_number_concatenation(text: str) -> list[Finding]:
     findings = []
     for m in NUMBER_BLOB_PATTERN.finditer(text):
         s = m.group(1)
-        line_no = _line_no(text, m.start())
+        # 跳过手机号、统一信用代码这类合法长数字
+        if _is_phone(s) or _is_uscc_digits(s):
+            continue
+        # 检查前后 ±30 字符的上下文里有没有"电话/信用代码/订单号"等字段名
+        start, end = m.start(), m.end()
+        ctx = text[max(0, start - 30): end + 30]
+        if _BLOB_SKIP_CONTEXT.search(ctx):
+            continue
+
+        line_no = _line_no(text, start)
         findings.append(Finding(
             severity="medium",
             category="格式问题",

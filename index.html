@@ -134,6 +134,9 @@
     <div class="flex items-center gap-4 text-xs mono" style="color: var(--ink-soft);">
       <span id="stage-label">就绪</span>
       <span id="progress-text"></span>
+      <button id="global-reset-btn"
+              class="pill px-2 py-1 rounded text-xs hover:opacity-80"
+              title="停掉正在跑的 OCR / 模型重启任务，回到上传页">重置</button>
     </div>
   </div>
   <div class="h-0.5" style="background: var(--bg-soft);">
@@ -307,6 +310,11 @@ function timerSetMsg(msg, cls) {
   }
 }
 
+// 只刷顶部最新行，不 append 历史。用于阶段内每秒刷新（秒数、估算 %）。
+function timerUpdateLatest(msg) {
+  timerLatest.textContent = msg;
+}
+
 function timerStart_() {
   timerStart = Date.now();
   findingCount = 0;
@@ -331,6 +339,24 @@ function timerFinish() {
 dropZone.addEventListener('drop', e => { if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
 fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
 $('#reset-btn').addEventListener('click', () => location.reload());
+
+// 全局重置：杀掉后端正在跑的 OCR / vLLM 任务，回到上传页
+$('#global-reset-btn').addEventListener('click', async () => {
+  if (!confirm('确认重置吗？\n会停掉正在跑的 OCR 与模型任务，回到上传页。')) return;
+  const btn = $('#global-reset-btn');
+  btn.disabled = true;
+  btn.textContent = '重置中…';
+  try {
+    const r = await fetch('/reset', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    console.log('[reset]', j);
+  } catch (e) {
+    console.error('[reset] 调用失败', e);
+  } finally {
+    // 无论结果如何，刷新页面回到上传页（前端状态彻底清空）
+    location.reload();
+  }
+});
 
 // ---------- 筛选 ----------
 document.querySelectorAll('.filter-btn').forEach(btn => {
@@ -389,7 +415,7 @@ async function useSample(name, title) {
   $('#upload-idle').classList.add('hidden');
   $('#upload-loading').classList.remove('hidden');
   $('#upload-loading-title').textContent = '加载样例…';
-  $('#upload-loading-sub').textContent = '已预 OCR，跳过上传，直接审核';
+  $('#upload-loading-sub').textContent = 'OCR 处理中…';
   $('#stage-label').textContent = '加载样例…';
 
   let meta;
@@ -403,6 +429,47 @@ async function useSample(name, title) {
     alert('加载样例失败：' + e.message);
     return;
   }
+
+  // 如果返回了 task_id，轮询查询进度
+  if (meta.task_id) {
+    let attempts = 0;
+    let lastStage = '';
+    const max_attempts = 600; // 10 分钟
+    // 中间区域只放简短状态，详细进度走底部计时器
+    $('#upload-loading-sub').textContent = '正在处理，进度见底部计时条';
+    while (attempts < max_attempts) {
+      const status_resp = await fetch(`/task-status/${meta.task_id}`);
+      const status = await status_resp.json();
+      if (status.status === 'done') {
+        meta = { ...meta, ...status };
+        break;
+      } else if (status.status === 'error') {
+        throw new Error('OCR 失败：' + status.error);
+      }
+      const stage = status.stage || '处理中';
+      const stageEl = Number.isFinite(status.stage_elapsed) ? status.stage_elapsed : 0;
+      const totEl = Number.isFinite(status.total_elapsed) ? status.total_elapsed : 0;
+      const totExp = Number.isFinite(status.total_expect_sec) ? status.total_expect_sec : 0;
+      const pct = status.progress || 0;
+      // 阶段切换 → append 一条历史；阶段内每秒只刷顶部最新行
+      if (stage !== lastStage) {
+        timerSetMsg(stage);
+        lastStage = stage;
+      }
+      // 显示「已用 / 预计 · 剩约」让用户看到剩多久，不再只是涨涨涨的总秒数
+      const remain = totExp > 0 ? Math.max(0, totExp - totEl) : 0;
+      const tip = totExp > 0
+        ? `本步 ${stageEl}s · 已用 ${totEl}s / 预计 ${totExp}s · 剩约 ${remain}s · ${pct}%`
+        : `本步 ${stageEl}s · 已用 ${totEl}s · ${pct}%`;
+      timerUpdateLatest(`${stage}（${tip}）`);
+      await new Promise(r => setTimeout(r, 1000));
+      attempts++;
+    }
+    if (attempts >= max_attempts) {
+      throw new Error('处理超时');
+    }
+  }
+
   timerSetMsg('样例就绪，进入审核');
   $('#upload-page').classList.add('hidden');
   $('#work-page').classList.remove('hidden');
