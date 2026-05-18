@@ -692,6 +692,78 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # 样例文件目录：预 OCR 完成的 markdown，让客户点一下就跑，省去上传等待
 SAMPLES_DIR = Path(__file__).parent / "samples"
 
+# 历史审核结果：持久化在项目目录里，重启不丢
+HISTORY_DIR = Path(__file__).parent / "audits"
+HISTORY_DIR.mkdir(exist_ok=True)
+
+
+def _save_audit_history(audit_id, file_id, filename, events, duration,
+                        char_count, section_count, baseline_summary):
+    """把一次 /audit 的全部事件 + 元数据落盘，供后续重放。"""
+    try:
+        data = {
+            "audit_id": audit_id,
+            "file_id": file_id,
+            "filename": filename,
+            "created_at": int(time.time()),
+            "duration_sec": int(duration),
+            "char_count": char_count,
+            "section_count": section_count,
+            "baseline_summary": baseline_summary,
+            "finding_count": sum(1 for e in events if e.get("type") == "finding"),
+            "events": events,
+        }
+        (HISTORY_DIR / f"{audit_id}.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.info(f"[audit-history] saved {audit_id} ({data['finding_count']} findings)")
+    except Exception as e:
+        logger.warning(f"[audit-history] save failed: {e}")
+
+
+@app.get("/audit-history")
+async def audit_history():
+    """列出全部历史审核（按时间倒序，仅返回摘要不含 findings）。"""
+    items = []
+    for fp in sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            d = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        # 检查原文 markdown 是否还在（不在就标记不可重开）
+        md_path = UPLOAD_DIR / d.get("file_id", "")
+        items.append({
+            "audit_id": d.get("audit_id"),
+            "file_id": d.get("file_id"),
+            "filename": d.get("filename"),
+            "created_at": d.get("created_at"),
+            "duration_sec": d.get("duration_sec"),
+            "char_count": d.get("char_count"),
+            "section_count": d.get("section_count"),
+            "finding_count": d.get("finding_count"),
+            "doc_available": md_path.exists(),
+        })
+    return {"items": items}
+
+
+@app.get("/audit-result/{audit_id}")
+async def audit_result(audit_id: str):
+    """返回某次历史审核的完整内容（含 events，供前端 replay）。"""
+    fp = HISTORY_DIR / f"{audit_id}.json"
+    if not fp.exists():
+        raise HTTPException(404, "audit 不存在")
+    return json.loads(fp.read_text(encoding="utf-8"))
+
+
+@app.delete("/audit-history/{audit_id}")
+async def delete_audit_history(audit_id: str):
+    """删除某条历史。"""
+    fp = HISTORY_DIR / f"{audit_id}.json"
+    if not fp.exists():
+        raise HTTPException(404, "audit 不存在")
+    fp.unlink()
+    return {"ok": True}
+
 
 def _sample_meta(name: str) -> dict | None:
     """对样例 markdown 取元数据"""
@@ -1041,37 +1113,52 @@ async def get_html(file_id: str):
 
 
 @app.get("/audit")
-async def audit(file_id: str):
-    """SSE 流：实时返回 findings"""
+async def audit(file_id: str, filename: str = ""):
+    """SSE 流：实时返回 findings。流结束时把全部事件落盘到 audits/。
+    filename 可选：调用方传过来用于历史列表展示，不传则用 file_id。
+    """
     path = UPLOAD_DIR / file_id
     if not path.exists():
         raise HTTPException(404, "file not found")
     text = parse_doc_to_text(path)
     sections = split_sections(text)
+    char_count = len(text)
+    section_count = len(sections)
+    display_name = filename or file_id
 
     async def gen():
+        events: list[dict] = []  # 全程累计事件，结束落盘
+        baseline_summary = ""
+        t0 = time.time()
+
+        def _track(ev: dict):
+            # 不把 SSE 包装符号存进去，只存纯 JSON
+            events.append(ev)
+            return sse(ev)
+
         # 阶段 1：规则扫描（毫秒级）
-        yield sse({"type": "stage", "msg": "执行规则核查…"})
+        yield _track({"type": "stage", "msg": "执行规则核查…"})
         for f in quick_scan(text):
             enrich_finding(f, text)
-            yield sse({"type": "finding", "data": f, "source": "rule"})
+            yield _track({"type": "finding", "data": f, "source": "rule"})
             await asyncio.sleep(0.01)
 
         # 阶段 2：抽取设计基线
-        yield sse({"type": "stage", "msg": "抽取设计基线（规范、参数、桥梁清单）…"})
+        yield _track({"type": "stage", "msg": "抽取设计基线（规范、参数、桥梁清单）…"})
         try:
             baseline = await extract_baseline(text)
-            yield sse({
+            baseline_summary = baseline[:300] + ("…" if len(baseline) > 300 else "")
+            yield _track({
                 "type": "baseline",
-                "summary": baseline[:300] + ("…" if len(baseline) > 300 else ""),
+                "summary": baseline_summary,
                 "length": len(baseline),
             })
         except Exception as e:
             baseline = ""
-            yield sse({"type": "stage", "msg": f"基线抽取失败：{e}，将按通用规则继续审核"})
+            yield _track({"type": "stage", "msg": f"基线抽取失败：{e}，将按通用规则继续审核"})
 
         # 阶段 3 & 4 并行：跨章节比对 + 各章节审读
-        yield sse({
+        yield _track({
             "type": "stage",
             "msg": f"启动智能审读：跨章节比对 + {len(sections)} 个章节并行…",
             "total": len(sections) + 1,
@@ -1117,18 +1204,30 @@ async def audit(file_id: str):
             try:
                 kind, idx, title, items = await coro
             except Exception as e:
-                # 单 task 异常被 run_section/run_cross 包了，这里不应该再炸；防御
                 done += 1
-                yield sse({"type": "progress", "done": done, "total": total, "section": f"(task error: {e})"})
+                yield _track({"type": "progress", "done": done, "total": total, "section": f"(task error: {e})"})
                 continue
             done += 1
-            yield sse({"type": "progress", "done": done, "total": total, "section": title})
+            yield _track({"type": "progress", "done": done, "total": total, "section": title})
             for it in items:
                 enrich_finding(it, text)
                 source = "cross" if kind == "cross" else "llm"
-                yield sse({"type": "finding", "data": it, "source": source})
+                yield _track({"type": "finding", "data": it, "source": source})
 
-        yield sse({"type": "done"})
+        yield _track({"type": "done"})
+
+        # 流结束后落盘 — 用 file_id stem + 时间戳作为 audit_id（可读）
+        audit_id = f"{Path(file_id).stem}__{int(t0)}"
+        _save_audit_history(
+            audit_id=audit_id,
+            file_id=file_id,
+            filename=display_name,
+            events=events,
+            duration=time.time() - t0,
+            char_count=char_count,
+            section_count=section_count,
+            baseline_summary=baseline_summary,
+        )
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

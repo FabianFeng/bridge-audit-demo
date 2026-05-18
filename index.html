@@ -180,6 +180,15 @@
       </div>
       <div id="samples-list" class="space-y-2"></div>
     </div>
+
+    <!-- 历史审核：点开即看完整结果，不再跑 OCR + LLM -->
+    <div id="history-block" class="mt-6 hidden">
+      <div class="text-xs mb-2 flex items-center gap-2" style="color: var(--ink-soft);">
+        <span class="serif">历史审核（点开即看，无需重跑）</span>
+        <span class="flex-1 border-t" style="border-color: var(--line);"></span>
+      </div>
+      <div id="history-list" class="space-y-2"></div>
+    </div>
   </div>
 </section>
 
@@ -477,10 +486,88 @@ async function useSample(name, title) {
   docFrame.src = `/html?file_id=${encodeURIComponent(meta.file_id)}`;
   fetch(`/text?file_id=${encodeURIComponent(meta.file_id)}`).then(r => r.json()).then(d => { docLines = d.lines; });
   docFrame.addEventListener('load', injectFrameStyles, { once: false });
-  startAudit(meta.file_id, meta.section_count);
+  startAudit(meta.file_id, meta.section_count, meta.filename);
 }
 
 loadSamples();
+loadHistory();
+
+// ---------- 历史审核记录 ----------
+async function loadHistory() {
+  try {
+    const r = await fetch('/audit-history');
+    const d = await r.json();
+    if (!d.items || !d.items.length) {
+      $('#history-block').classList.add('hidden');
+      return;
+    }
+    const list = $('#history-list');
+    list.innerHTML = d.items.map(it => {
+      const dt = new Date((it.created_at || 0) * 1000);
+      const dtStr = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')} ${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`;
+      const dur = `${it.duration_sec}s`;
+      const disabled = !it.doc_available;
+      return `
+        <button class="sample-card w-full ${disabled ? 'disabled' : ''}"
+                data-audit-id="${escape(it.audit_id)}"
+                ${disabled ? 'disabled title="原文档已清理，无法重开"' : ''}>
+          <div class="sample-icon">${it.finding_count}</div>
+          <div class="sample-text">
+            <div class="sample-title">${escape(it.filename || it.file_id)}</div>
+            <div class="sample-meta">${dtStr} · ${(it.char_count || 0).toLocaleString()} 字符 · ${it.section_count} 章 · 耗时 ${dur}${disabled ? ' · 原文已清理' : ''}</div>
+          </div>
+          <span class="sample-arrow">${disabled ? '×' : '→'}</span>
+        </button>
+      `;
+    }).join('');
+    $('#history-block').classList.remove('hidden');
+    list.querySelectorAll('.sample-card:not(.disabled)').forEach(card => {
+      card.addEventListener('click', () => openHistory(card.dataset.auditId));
+    });
+  } catch (e) {
+    console.warn('加载历史失败', e);
+    $('#history-block').classList.add('hidden');
+  }
+}
+
+async function openHistory(auditId) {
+  try {
+    const r = await fetch(`/audit-result/${encodeURIComponent(auditId)}`);
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+
+    // 切到工作页（不跑 OCR / LLM，直接 replay）
+    $('#upload-page').classList.add('hidden');
+    $('#work-page').classList.remove('hidden');
+    $('#file-name-inline').textContent =
+      `${data.filename || data.file_id} · ${(data.char_count || 0).toLocaleString()} 字符 · ${data.section_count} 章 · 历史记录`;
+    docFrame.src = `/html?file_id=${encodeURIComponent(data.file_id)}`;
+    fetch(`/text?file_id=${encodeURIComponent(data.file_id)}`).then(r => r.json()).then(d => { docLines = d.lines; });
+    docFrame.addEventListener('load', injectFrameStyles, { once: false });
+
+    // 重置状态后 replay 事件
+    allFindings = [];
+    findingCount = 0;
+    sourceCount = {};
+    updateStats();
+    renderFindings();
+
+    for (const msg of (data.events || [])) {
+      if (msg.type === 'finding') {
+        addFinding(msg.data, msg.source);
+        findingCount++;
+      } else if (msg.type === 'baseline') {
+        baselineSummary = msg.summary || '';
+      }
+    }
+
+    $('#progress-bar').style.width = '100%';
+    $('#progress-text').textContent = `${findingCount} 处`;
+    $('#stage-label').textContent = `历史记录 · ${findingCount} 处问题（耗时 ${data.duration_sec}s）`;
+  } catch (e) {
+    alert('打开历史失败：' + e.message);
+  }
+}
 
 // ---------- 主流程 ----------
 async function handleFile(file) {
@@ -559,7 +646,7 @@ async function handleFile(file) {
   // iframe 加载完后注入跳转高亮样式
   docFrame.addEventListener('load', injectFrameStyles, { once: false });
 
-  startAudit(meta.file_id, meta.section_count);
+  startAudit(meta.file_id, meta.section_count, meta.filename);
 }
 
 function injectFrameStyles() {
@@ -582,10 +669,11 @@ function injectFrameStyles() {
   } catch (e) { /* cross-origin? 本地无影响 */ }
 }
 
-function startAudit(fileId, totalSections) {
+function startAudit(fileId, totalSections, filename) {
   $('#stage-label').textContent = '审核中…';
   timerSetMsg('文档解析完成，开始审核');   // 不重置计时，接着上传阶段往下记
-  const es = new EventSource(`/audit?file_id=${encodeURIComponent(fileId)}`);
+  const fn = filename ? `&filename=${encodeURIComponent(filename)}` : '';
+  const es = new EventSource(`/audit?file_id=${encodeURIComponent(fileId)}${fn}`);
   es.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'stage') {
