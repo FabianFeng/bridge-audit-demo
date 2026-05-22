@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='[%(asctime)s] %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/data/demo_debug.log', encoding='utf-8'),
+        logging.FileHandler('demo_debug.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
